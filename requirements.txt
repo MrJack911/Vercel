@@ -2,3 +2,4 @@ playwright
 beautifulsoup4
 m3u8
 requests
+python-3.11
