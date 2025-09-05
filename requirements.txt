@@ -1,5 +1,2 @@
 requests
-m3u8
-playwright
 beautifulsoup4
-lxml
