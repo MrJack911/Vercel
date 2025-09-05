@@ -6,7 +6,7 @@ import requests
 from bs4 import BeautifulSoup
 import re
 
-SCRAPER_API_KEY = "YOUR_API_KEY"  # put your ScraperAPI key here
+SCRAPER_API_KEY = "281aa649d11a5df05db125c298695bc6"  # put your ScraperAPI key here
 
 def scrape_with_scraperapi(target_url):
     """Scrape a page using ScraperAPI and extract title, thumbnail, and video qualities"""
