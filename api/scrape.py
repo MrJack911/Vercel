@@ -1,84 +1,80 @@
-# api/scrape.py (Advanced Version)
+# api/scrape.py (Ultimate Version with Browserless.io)
 
 import os
 import json
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import requests
-from bs4 import BeautifulSoup
-import re
-import m3u8  # We need this library to parse playlists
 
-# Get the API Key securely from Vercel Environment Variables
-SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY")
+# Get API Keys securely from Vercel Environment Variables
+BROWSERLESS_API_KEY = os.environ.get("BROWSERLESS_API_KEY")
 
-def parse_m3u8_qualities(session, playlist_url):
-    """Parses an M3U8 playlist to extract different quality streams."""
-    qualities = {}
-    try:
-        response = session.get(playlist_url, timeout=10)
-        response.raise_for_status()
-        playlist = m3u8.loads(response.text, uri=playlist_url)
-
-        if playlist.is_variant:
-            for p in sorted(playlist.playlists, key=lambda x: x.stream_info.resolution[1], reverse=True):
-                if p.stream_info and p.stream_info.resolution:
-                    label = f"{p.stream_info.resolution[1]}p"
-                    if label not in qualities: # Add only the highest bandwidth for each resolution
-                        qualities[label] = p.absolute_uri
-    except Exception:
-        # If parsing fails, just return the original URL as a fallback
-        qualities['video'] = playlist_url
-        
-    return qualities
-
-def scrape_with_scraperapi(target_url: str):
+def scrape_with_browserless(target_url: str):
     """
-    Advanced scraper using ScraperAPI. Extracts title, thumbnail, and video qualities
-    from M3U8 and MP4 links, and parses M3U8 playlists.
+    Ultra-powerful scraper using Browserless.io to run Playwright and
+    intercept network requests to find video links.
     """
-    if not SCRAPER_API_KEY:
-        raise ValueError("ScraperAPI Key is not set in environment variables.")
+    if not BROWSERLESS_API_KEY:
+        raise ValueError("BROWSERLESS_API_KEY is not set in environment variables.")
 
-    api_url = "https://api.scraperapi.com"
-    params = {"api_key": SCRAPER_API_KEY, "url": target_url, "render": "true"}
+    api_url = f"https://chrome.browserless.io/scrape?token={BROWSERLESS_API_KEY}"
     
-    response = requests.get(api_url, params=params, timeout=90) # Increased timeout
+    # We will send a small Playwright script to Browserless to execute
+    # This script will listen for network requests ending in .m3u8 or .mp4
+    playwright_code = f"""
+    async (page, context) => {{
+        const video_links = new Set();
+        
+        // Listen for all network requests
+        page.on('request', request => {{
+            const url = request.url();
+            if (url.endsWith('.m3u8') || url.endsWith('.mp4')) {{
+                video_links.add(url);
+            }}
+        }});
+
+        await page.goto('{target_url}', {{ waitUntil: 'networkidle0', timeout: 90000 }});
+
+        // Also extract metadata from the page
+        const title = await page.title();
+        
+        let thumbnail = await page.evaluate(() => {{
+            const ogImage = document.querySelector('meta[property="og:image"]');
+            return ogImage ? ogImage.content : null;
+        }});
+
+        return {{
+            data: {{
+                title: title,
+                thumbnail: thumbnail || '',
+                links: Array.from(video_links)
+            }},
+            type: 'application/json'
+        }};
+    }}
+    """
+    
+    headers = {'Content-Type': 'application/javascript'}
+    
+    # Make the request to Browserless.io API
+    response = requests.post(api_url, headers=headers, data=playwright_code, timeout=120)
     response.raise_for_status()
-    html_content = response.text
-    soup = BeautifulSoup(html_content, "lxml")
+    
+    result = response.json()
+    scraped_data = result.get('data', {})
 
-    # --- Data Extraction ---
-    title_tag = soup.find("meta", property="og:title") or soup.find("title")
-    title = title_tag.get("content", "Untitled").strip() if title_tag else "Untitled"
-
-    thumbnail_tag = soup.find("meta", property="og:image")
-    thumbnail = thumbnail_tag.get("content", "") if thumbnail_tag else ""
-
-    # --- Advanced Link Finding ---
-    # Find M3U8 and MP4 links from the entire HTML and script tags
-    all_links = re.findall(r'https?://[^\'"]+\.(m3u8|mp4)[^\'"]*', html_content)
-    unique_links = sorted(list(set(all_links)), key=lambda x: ".m3u8" not in x) # Prioritize M3U8
-
-    final_qualities = {}
-    session = requests.Session()
-
-    for link in unique_links:
-        if link.endswith('.m3u8'):
-            # Parse this M3U8 to find multiple qualities inside it
-            parsed = parse_m3u8_qualities(session, link)
-            final_qualities.update(parsed)
-            # If we found a master playlist, we can stop
-            if len(parsed) > 1:
-                break 
-        elif link.endswith('.mp4'):
-            # Simple MP4 link, add it with a generic name if no M3U8 was found
-            if not any('.m3u8' in l for l in unique_links):
-                 final_qualities[f"video_{len(final_qualities)+1}"] = link
+    # Organize qualities from the found links
+    final_qualities = {{}}
+    for i, link in enumerate(scraped_data.get('links', []), 1):
+        # Here we are not parsing m3u8 yet to keep it simple, but we can add it later
+        if '.m3u8' in link:
+            final_qualities[f"m3u8_stream_{i}"] = link
+        elif '.mp4' in link:
+            final_qualities[f"mp4_video_{i}"] = link
 
     return {
-        "title": title,
-        "thumbnail": thumbnail,
+        "title": scraped_data.get('title', 'Untitled'),
+        "thumbnail": scraped_data.get('thumbnail', ''),
         "qualities": final_qualities
     }
 
@@ -92,7 +88,7 @@ class handler(BaseHTTPRequestHandler):
     def _handle_request(self, url):
         if not url:
             return self._send_response(400, {"error": "URL is required."})
-        scraped_data = scrape_with_scraperapi(url)
+        scraped_data = scrape_with_browserless(url)
         self._send_response(200, scraped_data)
 
     def do_GET(self):
