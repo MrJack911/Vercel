@@ -2,28 +2,49 @@
 
 import json
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urljoin, urlparse
 import requests
-import m3u8
-from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 import re
 
-def parse_m3u8(session, m3u8_url, base_url):
-    """Parses M3U8 files and returns quality links."""
+SCRAPER_API_KEY = "YOUR_API_KEY"  # put your ScraperAPI key here
+
+def scrape_with_scraperapi(target_url):
+    """Scrape a page using ScraperAPI and extract title, thumbnail, and video qualities"""
+    api_url = "https://api.scraperapi.com"
+    params = {
+        "api_key": SCRAPER_API_KEY,
+        "url": target_url,
+        "render": "true"  # enable JavaScript rendering
+    }
+
+    r = requests.get(api_url, params=params, timeout=30)
+    r.raise_for_status()
+    html_content = r.text
+
+    soup = BeautifulSoup(html_content, "lxml")
+
+    # Extract title
+    title_tag = soup.find("meta", property="og:title") or soup.find("title")
+    title = title_tag.get("content", "Untitled").strip() if title_tag else "Untitled"
+
+    # Extract thumbnail
+    thumbnail_tag = soup.find("meta", property="og:image")
+    thumbnail = thumbnail_tag.get("content", "") if thumbnail_tag else ""
+
+    # Extract m3u8 links
+    m3u8_links = re.findall(r'https?://[^\'"]+\.m3u8[^\'"]*', html_content)
+
+    # Organize qualities (basic version: just return all m3u8 links)
     qualities = {}
-    try:
-        r = session.get(m3u8_url, timeout=5)
-        r.raise_for_status()
-        playlist = m3u8.loads(r.text, uri=m3u8_url)
-        if playlist.is_variant:
-            for p in playlist.playlists:
-                if p.stream_info and p.stream_info.resolution:
-                    label = f"{p.stream_info.resolution[1]}p"
-                    qualities[label] = p.absolute_uri
-    except Exception:
-        pass
-    return qualities
+    for i, link in enumerate(m3u8_links, 1):
+        qualities[f"link_{i}"] = link
+
+    return {
+        "title": title,
+        "thumbnail": thumbnail,
+        "qualities": qualities
+    }
+
 
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -40,36 +61,7 @@ class handler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"error": "URL is required"}).encode())
                 return
 
-            with sync_playwright() as p:
-                # Optimized launch arguments for serverless environments
-                browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-                page = browser.new_page()
-                # Reduced timeout to fit within Vercel's limits
-                page.goto(page_url, wait_until="domcontentloaded", timeout=15000)
-                html_content = page.content()
-                browser.close()
-
-            soup = BeautifulSoup(html_content, "lxml")
-            
-            title_tag = soup.find("meta", property="og:title") or soup.find("title")
-            title = title_tag.get("content", "Untitled").strip() if title_tag else "Untitled"
-            
-            thumbnail_tag = soup.find("meta", property="og:image")
-            thumbnail = thumbnail_tag.get("content", "") if thumbnail_tag else ""
-
-            # Simplified and faster M3U8 search
-            m3u8_links = set(re.findall(r'["\'](https?://[^\'"]+\.m3u8[^"\']*)["\']', html_content))
-            
-            found_qualities = {}
-            session = requests.Session()
-            for link in m3u8_links:
-                found_qualities.update(parse_m3u8(session, link, page_url))
-            
-            data = {
-                "title": title,
-                "thumbnail": thumbnail,
-                "qualities": found_qualities
-            }
+            data = scrape_with_scraperapi(page_url)
 
             self.send_response(200)
             self.send_header("Content-type", "application/json")
