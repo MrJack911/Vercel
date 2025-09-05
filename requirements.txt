@@ -1,4 +1,1 @@
 requests
-beautifulsoup4
-lxml
-m3u8
