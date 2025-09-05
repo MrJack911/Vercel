@@ -1,4 +1,4 @@
-# api/scrape.py
+# api/scrape.py (Advanced Version)
 
 import os
 import json
@@ -7,29 +7,45 @@ from urllib.parse import urlparse, parse_qs
 import requests
 from bs4 import BeautifulSoup
 import re
+import m3u8  # We need this library to parse playlists
 
 # Get the API Key securely from Vercel Environment Variables
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY")
 
+def parse_m3u8_qualities(session, playlist_url):
+    """Parses an M3U8 playlist to extract different quality streams."""
+    qualities = {}
+    try:
+        response = session.get(playlist_url, timeout=10)
+        response.raise_for_status()
+        playlist = m3u8.loads(response.text, uri=playlist_url)
+
+        if playlist.is_variant:
+            for p in sorted(playlist.playlists, key=lambda x: x.stream_info.resolution[1], reverse=True):
+                if p.stream_info and p.stream_info.resolution:
+                    label = f"{p.stream_info.resolution[1]}p"
+                    if label not in qualities: # Add only the highest bandwidth for each resolution
+                        qualities[label] = p.absolute_uri
+    except Exception:
+        # If parsing fails, just return the original URL as a fallback
+        qualities['video'] = playlist_url
+        
+    return qualities
+
 def scrape_with_scraperapi(target_url: str):
     """
-    Scrapes a page using ScraperAPI and extracts title, thumbnail, and m3u8 links.
+    Advanced scraper using ScraperAPI. Extracts title, thumbnail, and video qualities
+    from M3U8 and MP4 links, and parses M3U8 playlists.
     """
     if not SCRAPER_API_KEY:
         raise ValueError("ScraperAPI Key is not set in environment variables.")
 
     api_url = "https://api.scraperapi.com"
-    params = {
-        "api_key": SCRAPER_API_KEY,
-        "url": target_url,
-        "render": "true"  # Enable JavaScript rendering
-    }
-
-    # Make the request to ScraperAPI
-    response = requests.get(api_url, params=params, timeout=45)
-    response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+    params = {"api_key": SCRAPER_API_KEY, "url": target_url, "render": "true"}
+    
+    response = requests.get(api_url, params=params, timeout=90) # Increased timeout
+    response.raise_for_status()
     html_content = response.text
-
     soup = BeautifulSoup(html_content, "lxml")
 
     # --- Data Extraction ---
@@ -39,53 +55,60 @@ def scrape_with_scraperapi(target_url: str):
     thumbnail_tag = soup.find("meta", property="og:image")
     thumbnail = thumbnail_tag.get("content", "") if thumbnail_tag else ""
 
-    m3u8_links = list(set(re.findall(r'https?://[^\'"]+\.m3u8[^\'"]*', html_content)))
+    # --- Advanced Link Finding ---
+    # Find M3U8 and MP4 links from the entire HTML and script tags
+    all_links = re.findall(r'https?://[^\'"]+\.(m3u8|mp4)[^\'"]*', html_content)
+    unique_links = sorted(list(set(all_links)), key=lambda x: ".m3u8" not in x) # Prioritize M3U8
 
-    # Organize qualities (simple version)
-    qualities = {f"link_{i}": link for i, link in enumerate(m3u8_links, 1)}
+    final_qualities = {}
+    session = requests.Session()
+
+    for link in unique_links:
+        if link.endswith('.m3u8'):
+            # Parse this M3U8 to find multiple qualities inside it
+            parsed = parse_m3u8_qualities(session, link)
+            final_qualities.update(parsed)
+            # If we found a master playlist, we can stop
+            if len(parsed) > 1:
+                break 
+        elif link.endswith('.mp4'):
+            # Simple MP4 link, add it with a generic name if no M3U8 was found
+            if not any('.m3u8' in l for l in unique_links):
+                 final_qualities[f"video_{len(final_qualities)+1}"] = link
 
     return {
         "title": title,
         "thumbnail": thumbnail,
-        "qualities": qualities
+        "qualities": final_qualities
     }
 
 class handler(BaseHTTPRequestHandler):
     def _send_response(self, status_code, data):
-        """Helper to send a JSON response."""
         self.send_response(status_code)
         self.send_header("Content-type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(data).encode("utf-8"))
 
+    def _handle_request(self, url):
+        if not url:
+            return self._send_response(400, {"error": "URL is required."})
+        scraped_data = scrape_with_scraperapi(url)
+        self._send_response(200, scraped_data)
+
     def do_GET(self):
-        """Handles GET requests for browser testing."""
         try:
             query_components = parse_qs(urlparse(self.path).query)
             page_url = query_components.get("url", [None])[0]
-
-            if not page_url:
-                return self._send_response(400, {"error": "Query parameter 'url' is required."})
-
-            scraped_data = scrape_with_scraperapi(page_url)
-            self._send_response(200, scraped_data)
-
+            self._handle_request(page_url)
         except Exception as e:
-            self._send_response(500, {"error": str(e)})
+            self._send_response(500, {"error": f"GET Error: {str(e)}"})
 
     def do_POST(self):
-        """Handles POST requests from your bot."""
         try:
             content_length = int(self.headers["Content-Length"])
             post_data = self.rfile.read(content_length)
             payload = json.loads(post_data)
             page_url = payload.get("url")
-
-            if not page_url:
-                return self._send_response(400, {"error": "JSON payload key 'url' is required."})
-
-            scraped_data = scrape_with_scraperapi(page_url)
-            self._send_response(200, scraped_data)
-
+            self._handle_request(page_url)
         except Exception as e:
-            self._send_response(500, {"error": str(e)})
+            self._send_response(500, {"error": f"POST Error: {str(e)}"})
