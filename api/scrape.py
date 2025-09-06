@@ -1,94 +1,130 @@
-import os
-import json
+import os, json, re, requests, m3u8
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-import requests
 from bs4 import BeautifulSoup
-import re
-import m3u8
 
-# Get the API Key securely from Vercel Environment Variables
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY")
 
-def parse_m3u8_qualities(session, playlist_url):
-    """Parses an M3U8 playlist to extract different quality streams."""
+def parse_m3u8_recursive(session, url, visited=None):
+    """Recursively parse M3U8 to extract all quality streams."""
+    if visited is None:
+        visited = set()
+    if url in visited:
+        return {}
+    visited.add(url)
+
     qualities = {}
     try:
-        response = session.get(playlist_url, timeout=10)
-        response.raise_for_status()
-        playlist = m3u8.loads(response.text, uri=playlist_url)
+        res = session.get(url, timeout=15)
+        res.raise_for_status()
+        playlist = m3u8.loads(res.text, uri=url)
 
         if playlist.is_variant:
-            for p in sorted(playlist.playlists, key=lambda x: x.stream_info.resolution[1] if x.stream_info.resolution else 0, reverse=True):
+            for p in playlist.playlists:
                 if p.stream_info and p.stream_info.resolution:
-                    label = f"{p.stream_info.resolution[1]}p"
-                    if label not in qualities:
-                        qualities[label] = p.absolute_uri
-    except Exception:
-        qualities['video_stream'] = playlist_url
+                    width, height = p.stream_info.resolution
+                    label = f"{height}p"
+                    qualities[label] = p.absolute_uri
+                    # Recursively dive into sub-playlists
+                    sub_q = parse_m3u8_recursive(session, p.absolute_uri, visited)
+                    qualities.update(sub_q)
+        else:
+            # Not a variant, just return as "auto"
+            qualities["auto"] = url
+    except Exception as e:
+        qualities["fallback"] = url
     return qualities
+
+def extract_links_and_scripts(html):
+    """Extract all potential media URLs from HTML and inline scripts."""
+    urls = set()
+
+    # 1. Generic video links
+    url_matches = re.findall(r'https?://[^\s"\']+\.(m3u8|mp4|mpd|webm)[^\s"\']*', html, re.IGNORECASE)
+    urls.update(url_matches)
+
+    # 2. From <script> JSON blobs
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        for script in soup.find_all("script"):
+            if not script.string:
+                continue
+            # extract URLs inside JSON
+            found = re.findall(r'https?://[^\s"\']+\.(m3u8|mp4|mpd|webm)[^\s"\']*', script.string, re.IGNORECASE)
+            urls.update(found)
+    except Exception:
+        pass
+
+    return list(urls)
 
 def scrape_with_scraperapi(target_url: str):
     if not SCRAPER_API_KEY:
-        raise ValueError("SCRAPER_API_KEY is not set in environment variables.")
+        raise ValueError("Missing SCRAPER_API_KEY")
 
     api_url = "https://api.scraperapi.com"
     params = {"api_key": SCRAPER_API_KEY, "url": target_url, "render": "true"}
-    
-    response = requests.get(api_url, params=params, timeout=90)
-    response.raise_for_status()
-    html_content = response.text
-    soup = BeautifulSoup(html_content, "lxml")
 
-    title_tag = soup.find("meta", property="og:title") or soup.find("title")
-    title = title_tag.get("content", "Untitled").strip() if title_tag else "Untitled"
+    r = requests.get(api_url, params=params, timeout=90)
+    r.raise_for_status()
+    html = r.text
+    soup = BeautifulSoup(html, "lxml")
 
-    thumbnail_tag = soup.find("meta", property="og:image")
-    thumbnail = thumbnail_tag.get("content", "") if thumbnail_tag else ""
+    # Metadata
+    def meta(prop, attr="content"):
+        tag = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
+        return tag.get(attr, "").strip() if tag and tag.has_attr(attr) else ""
 
-    all_links = re.findall(r'https?://[^\'"]+\.(m3u8|mp4)[^\'"]*', html_content)
-    unique_links = sorted(list(set(all_links)), key=lambda x: ".m3u8" not in x)
+    title = meta("og:title") or (soup.title.string.strip() if soup.title else "Untitled")
+    desc = meta("og:description") or meta("description")
+    thumb = meta("og:image")
+
+    # Collect all media URLs
+    media_urls = extract_links_and_scripts(html)
 
     final_qualities = {}
     session = requests.Session()
 
-    for link in unique_links:
-        if link.endswith('.m3u8'):
-            parsed = parse_m3u8_qualities(session, link)
-            final_qualities.update(parsed)
-            if len(parsed) > 1: break 
-        elif link.endswith('.mp4'):
-            if not final_qualities:
-                 final_qualities[f"video_{len(final_qualities)+1}"] = link
+    for link in media_urls:
+        if link.endswith(".m3u8"):
+            q = parse_m3u8_recursive(session, link)
+            final_qualities.update(q)
+        elif link.endswith(".mp4"):
+            label = f"mp4_{len(final_qualities)+1}"
+            final_qualities[label] = link
+        elif link.endswith(".mpd"):
+            final_qualities["dash"] = link
+        elif link.endswith(".webm"):
+            final_qualities[f"webm_{len(final_qualities)+1}"] = link
 
-    return {"title": title, "thumbnail": thumbnail, "qualities": final_qualities}
+    return {
+        "title": title,
+        "description": desc,
+        "thumbnail": thumb,
+        "qualities": final_qualities,
+        "raw_links": media_urls
+    }
 
 class handler(BaseHTTPRequestHandler):
-    def _send_response(self, status_code, data):
-        self.send_response(status_code)
-        self.send_header("Content-type", "application/json")
+    def _send_response(self, status, data):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode("utf-8"))
+        self.wfile.write(json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
 
-    def _handle_request(self, url):
-        if not url: return self._send_response(400, {"error": "URL is required."})
-        scraped_data = scrape_with_scraperapi(url)
-        self._send_response(200, scraped_data)
+    def _handle(self, url):
+        if not url:
+            return self._send_response(400, {"error": "URL is required"})
+        try:
+            data = scrape_with_scraperapi(url)
+            self._send_response(200, data)
+        except Exception as e:
+            self._send_response(500, {"error": str(e)})
 
     def do_GET(self):
-        try:
-            query_components = parse_qs(urlparse(self.path).query)
-            page_url = query_components.get("url", [None])[0]
-            self._handle_request(page_url)
-        except Exception as e:
-            self._send_response(500, {"error": f"{str(e)}"})
+        query = parse_qs(urlparse(self.path).query)
+        self._handle(query.get("url", [None])[0])
 
     def do_POST(self):
-        try:
-            content_length = int(self.headers["Content-Length"])
-            post_data = self.rfile.read(content_length)
-            payload = json.loads(post_data)
-            page_url = payload.get("url")
-            self._handle_request(page_url)
-        except Exception as e:
-            self._send_response(500, {"error": f"{str(e)}"})
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length)) if length else {}
+        self._handle(body.get("url"))
