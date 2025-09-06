@@ -128,3 +128,13 @@ class handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length)) if length else {}
         self._handle(body.get("url"))
+
+# ഈ പുതിയ ഭാഗം താഴെ ചേർക്കുക
+if __name__ == "__main__":
+    from http.server import HTTPServer
+    # Koyeb നൽകുന്ന പോർട്ട് എടുക്കുന്നു, ഇല്ലെങ്കിൽ 8080 ഉപയോഗിക്കുന്നു
+    port = int(os.environ.get("PORT", 8080))
+    server_address = ("", port)
+    httpd = HTTPServer(server_address, handler)
+    print(f"Starting server on port {port}...")
+    httpd.serve_forever()
